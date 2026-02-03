@@ -1,0 +1,444 @@
+#!/usr/bin/env bash
+# --- Config ---
+API_KEY="${OPENROUTER_API_KEY:-sk-or-v1-REPLACE_THIS_KEY}"
+API_URL="https://openrouter.ai/api/v1/chat/completions"
+MODEL="arcee-ai/trinity-large-preview:free"
+
+# Colors
+BLUE='\033[1;34m'
+GREEN='\033[1;32m'
+CYAN='\033[1;36m'
+YELLOW='\033[1;33m'
+PINK='\033[1;35m'
+GRAY='\033[0;90m'
+RED='\033[1;31m'
+NC='\033[0m'
+
+# Conversation history file
+HISTORY_FILE=".chat_history.json"
+
+# Dangerous commands that require confirmation
+DANGEROUS_PATTERNS=(
+    "rm -rf"
+    "rm -fr"
+    "rm -r"
+    "dd if="
+    "mkfs"
+    "format"
+    "> /dev/"
+    "chmod -R 777"
+    "chown -R"
+    "kill -9"
+    "killall"
+    "shutdown"
+    "reboot"
+    "init 0"
+    "init 6"
+    "systemctl stop"
+    "systemctl disable"
+    "iptables -F"
+    "mv /* "
+    "cp /* "
+    "find / -delete"
+    "find . -delete"
+    "curl | sh"
+    "wget | sh"
+    "curl | bash"
+    "wget | bash"
+)
+
+# --- Cleanup function ---
+cleanup() {
+    echo -e "\n\n${PINK}Goodbye!${NC}\n"
+    rm -f "$HISTORY_FILE"
+    exit 0
+}
+
+# Trap Ctrl+C
+trap cleanup SIGINT
+
+# --- Spinner Function ---
+spinner() {
+    local pid=$1
+    local delay=0.08
+    local frames=('⠋' '⠙' '⠹' '⠸' '⠼' '⠴' '⠦' '⠧' '⠇' '⠏')
+    local counter=0
+    
+    tput civis
+    while kill -0 "$pid" 2>/dev/null; do
+        local frame_index=$((counter % ${#frames[@]}))
+        printf "\r${BLUE}${frames[$frame_index]} AI is thinking...${NC}"
+        sleep $delay
+        ((counter++))
+    done
+    printf "\r${GREEN}✓ Response received!${NC}\n"
+    tput cnorm
+}
+
+# --- Check if command is dangerous ---
+is_dangerous_command() {
+    local cmd="$1"
+    for pattern in "${DANGEROUS_PATTERNS[@]}"; do
+        if [[ "$cmd" == *"$pattern"* ]]; then
+            return 0
+        fi
+    done
+    return 1
+}
+
+# --- Ask user for confirmation ---
+ask_confirmation() {
+    local cmd="$1"
+    echo -e "\n${RED}⚠️  WARNING: Potentially dangerous command detected!${NC}"
+    echo -e "${YELLOW}Command: ${NC}$cmd"
+    echo -e "${RED}This command could:${NC}"
+    echo -e "${RED}- Delete files or directories${NC}"
+    echo -e "${RED}- Modify system settings${NC}"
+    echo -e "${RED}- Harm your system${NC}\n"
+    echo -ne "${YELLOW}Do you want to execute this command? (yes/no): ${NC}"
+    read -r confirmation
+    
+    if [[ "$confirmation" == "yes" ]]; then
+        return 0
+    else
+        return 1
+    fi
+}
+
+# --- Get file tree structure ---
+get_file_tree() {
+    if command -v tree >/dev/null 2>&1; then
+        tree -L 2 -I 'node_modules|.git|__pycache__|*.pyc' --charset ascii 2>/dev/null
+    else
+        find . -maxdepth 2 -not -path '*/\.*' -not -path '*/node_modules/*' | head -50
+    fi
+}
+
+# --- Read file content ---
+read_file_content() {
+    local filepath="$1"
+    if [ -f "$filepath" ]; then
+        cat "$filepath"
+    else
+        echo "Error: File not found"
+    fi
+}
+
+# --- List files in directory ---
+list_files() {
+    ls -lah --color=never 2>/dev/null || ls -lah
+}
+
+# --- Execute bash command ---
+execute_command() {
+    local cmd="$1"
+    eval "$cmd" 2>&1
+}
+
+# --- Initialize history ---
+if [ ! -f "$HISTORY_FILE" ]; then
+    echo '[]' > "$HISTORY_FILE"
+fi
+
+# --- Enhanced System Prompt ---
+SYSTEM_PROMPT="You are Mr.claw, an expert software engineer AI assistant with access to bash tools.
+
+## CAPABILITIES (Tools)
+You can:
+- Analyze code structure, patterns, and architecture
+- Read and understand file contents
+- Navigate file systems and project structures
+- Execute bash commands for system operations
+- Debug issues by reasoning through problem spaces
+- Generate production-ready code following best practices
+- Review code for security, performance, and maintainability
+- Suggest refactoring and optimization strategies
+
+## AVAILABLE BASH TOOLS
+When you need to interact with the file system, respond with action requests:
+1. \"read_file\": \"<filepath>\" - Read contents of a specific file
+2. \"list_files\": \"<directory>\" - List files in a directory (default: current)
+3. \"file_tree\": \"show\" - Show directory structure
+4. \"execute\": \"<bash_command>\" - Execute a bash command
+
+## RESPONSE FORMAT
+You MUST respond in valid JSON format:
+{
+  \"explanation\": \"Your reasoning or analysis\",
+  \"code\": \"Code if generating/modifying, or empty string\",
+  \"lang\": \"language identifier (python, javascript, bash, etc.)\",
+  \"action\": \"read_file|list_files|file_tree|execute|none\",
+  \"action_param\": \"parameter for the action (filepath, command, etc.)\",
+  \"requires_confirmation\": true/false
+}
+
+## SAFETY GUIDELINES
+- Set \"requires_confirmation\": true for ANY potentially dangerous commands including:
+  * File deletion (rm, especially rm -rf)
+  * System modifications (chmod 777, chown -R)
+  * Process termination (kill, killall)
+  * System control (shutdown, reboot)
+  * Disk operations (dd, mkfs, format)
+  * Piping curl/wget to shell
+  * Mass operations on root or system directories
+- Always explain WHY a command might be dangerous
+- Suggest safer alternatives when possible
+- Be conservative - if unsure, require confirmation
+
+## BEHAVIORAL GUIDELINES
+- Ask to read files when you need their content to provide accurate help
+- Use file_tree to understand project structure before making suggestions
+- Keep explanations concise and actionable
+- Prioritize clean, readable code
+- Include error handling in examples
+- When unsure about file contents, request to read them
+- ALWAYS set requires_confirmation to true for potentially dangerous operations
+
+Current Environment:
+- OS: $(uname -s)
+- Working Directory: $(pwd)
+- Shell: $SHELL
+
+Always return valid JSON."
+
+# --- Welcome Banner ---
+clear
+echo -e "${CYAN}╔══════════════════════════════════════════╗${NC}"
+echo -e "${CYAN}║${NC}       ${YELLOW}Mr.claw AI Assistant${NC}            ${CYAN}║${NC}"
+echo -e "${CYAN}╚══════════════════════════════════════════╝${NC}"
+echo -e "${GRAY}Press Ctrl+C to exit${NC}\n"
+
+# --- Main Chat Loop ---
+while true; do
+    # Get user input
+    echo -ne "${GREEN}You >${NC} "
+    read -r USER_INPUT
+    
+    # Skip empty input
+    if [ -z "$USER_INPUT" ]; then
+        continue
+    fi
+    
+    START_TIME=$(date +%s%N)
+    
+    # Build the prompt
+    PROMPT="$USER_INPUT"
+    
+    # Load conversation history
+    MESSAGES=$(cat "$HISTORY_FILE")
+    
+    # Add user message to history
+    MESSAGES=$(echo "$MESSAGES" | jq --arg content "$PROMPT" '. += [{"role": "user", "content": $content}]')
+    
+    # Build payload with history
+    PAYLOAD=$(jq -n --arg m "$MODEL" --argjson msgs "$MESSAGES" --arg s "$SYSTEM_PROMPT" \
+    '{
+      model: $m,
+      messages: ([{role: "system", content: $s}] + $msgs),
+      response_format: {type: "json_object"}
+    }')
+    
+    # API Call
+    curl -s -X POST "$API_URL" \
+        -H "Authorization: Bearer $API_KEY" \
+        -H "Content-Type: application/json" \
+        -d "$PAYLOAD" > .response.json &
+    PID=$!
+    spinner $PID
+    
+    # Read result
+    RES=$(cat .response.json)
+    rm .response.json
+    
+    # Extract JSON
+    JSON_OUT=$(echo "$RES" | jq -r '.choices[0].message.content')
+    
+    # Fallback if model breaks JSON
+    if ! echo "$JSON_OUT" | jq . >/dev/null 2>&1; then
+        JSON_OUT=$(echo "$RES" | sed -n 's/.*\({.*}\).*/\1/p')
+    fi
+    
+    EXP=$(echo "$JSON_OUT" | jq -r '.explanation // "No explanation provided."')
+    CODE=$(echo "$JSON_OUT" | jq -r '.code // empty')
+    LANG=$(echo "$JSON_OUT" | jq -r '.lang // "text"')
+    ACTION=$(echo "$JSON_OUT" | jq -r '.action // "none"')
+    ACTION_PARAM=$(echo "$JSON_OUT" | jq -r '.action_param // ""')
+    REQUIRES_CONFIRM=$(echo "$JSON_OUT" | jq -r '.requires_confirmation // false')
+    
+    # Save assistant response to history
+    MESSAGES=$(echo "$MESSAGES" | jq --arg content "$JSON_OUT" '. += [{"role": "assistant", "content": $content}]')
+    echo "$MESSAGES" > "$HISTORY_FILE"
+    
+    END_TIME=$(date +%s%N)
+    DURATION=$(( (END_TIME - START_TIME) / 1000000 ))
+    
+    # Output
+    echo -e "\n${BLUE}Mr.claw >${NC}"
+    echo -e "${GREEN}📝 INFO:${NC}"
+    echo -e "$EXP"
+    
+    # Handle actions
+    if [[ "$ACTION" != "none" && "$ACTION" != "null" ]]; then
+        echo -e "\n${YELLOW}🔧 ACTION: ${ACTION^^}${NC}"
+        
+        case "$ACTION" in
+            "read_file")
+                if [ -n "$ACTION_PARAM" ]; then
+                    echo -e "${CYAN}Reading file: $ACTION_PARAM${NC}"
+                    FILE_CONTENT=$(read_file_content "$ACTION_PARAM")
+                    
+                    # Send file content back to AI
+                    FOLLOWUP_PROMPT="Here is the content of $ACTION_PARAM:\n\n$FILE_CONTENT\n\nPlease analyze this and provide your response."
+                    MESSAGES=$(echo "$MESSAGES" | jq --arg content "$FOLLOWUP_PROMPT" '. += [{"role": "user", "content": $content}]')
+                    
+                    PAYLOAD=$(jq -n --arg m "$MODEL" --argjson msgs "$MESSAGES" --arg s "$SYSTEM_PROMPT" \
+                    '{
+                      model: $m,
+                      messages: ([{role: "system", content: $s}] + $msgs),
+                      response_format: {type: "json_object"}
+                    }')
+                    
+                    curl -s -X POST "$API_URL" \
+                        -H "Authorization: Bearer $API_KEY" \
+                        -H "Content-Type: application/json" \
+                        -d "$PAYLOAD" > .response.json &
+                    PID=$!
+                    spinner $PID
+                    
+                    RES=$(cat .response.json)
+                    rm .response.json
+                    
+                    JSON_OUT=$(echo "$RES" | jq -r '.choices[0].message.content')
+                    if ! echo "$JSON_OUT" | jq . >/dev/null 2>&1; then
+                        JSON_OUT=$(echo "$RES" | sed -n 's/.*\({.*}\).*/\1/p')
+                    fi
+                    
+                    EXP=$(echo "$JSON_OUT" | jq -r '.explanation // "No explanation provided."')
+                    CODE=$(echo "$JSON_OUT" | jq -r '.code // empty')
+                    LANG=$(echo "$JSON_OUT" | jq -r '.lang // "text"')
+                    
+                    MESSAGES=$(echo "$MESSAGES" | jq --arg content "$JSON_OUT" '. += [{"role": "assistant", "content": $content}]')
+                    echo "$MESSAGES" > "$HISTORY_FILE"
+                    
+                    echo -e "\n${BLUE}Mr.claw >${NC}"
+                    echo -e "${GREEN}📝 ANALYSIS:${NC}"
+                    echo -e "$EXP"
+                fi
+                ;;
+            
+            "list_files")
+                echo -e "${CYAN}Listing files...${NC}\n"
+                LIST_OUTPUT=$(list_files)
+                echo "$LIST_OUTPUT"
+                ;;
+            
+            "file_tree")
+                echo -e "${CYAN}Showing directory structure...${NC}\n"
+                TREE_OUTPUT=$(get_file_tree)
+                echo "$TREE_OUTPUT"
+                ;;
+            
+            "execute")
+                if [ -n "$ACTION_PARAM" ]; then
+                    # Check if command is dangerous (both AI suggestion and our pattern matching)
+                    NEEDS_CONFIRM=false
+                    
+                    if [[ "$REQUIRES_CONFIRM" == "true" ]]; then
+                        NEEDS_CONFIRM=true
+                    elif is_dangerous_command "$ACTION_PARAM"; then
+                        NEEDS_CONFIRM=true
+                    fi
+                    
+                    if [ "$NEEDS_CONFIRM" = true ]; then
+                        if ask_confirmation "$ACTION_PARAM"; then
+                            echo -e "${GREEN}✓ Executing command...${NC}\n"
+                            EXEC_OUTPUT=$(execute_command "$ACTION_PARAM")
+                            echo "$EXEC_OUTPUT"
+                        else
+                            echo -e "${RED}✗ Command execution cancelled by user${NC}"
+                        fi
+                    else
+                        echo -e "${CYAN}Executing: $ACTION_PARAM${NC}\n"
+                        EXEC_OUTPUT=$(execute_command "$ACTION_PARAM")
+                        echo "$EXEC_OUTPUT"
+                    fi
+                fi
+                ;;
+        esac
+    fi
+    
+    # Display code if present
+    if [[ -n "$CODE" && "$CODE" != "null" ]]; then
+        echo -e "\n${YELLOW}💻 ${LANG^^}${NC}"
+        
+        MAX_LEN=$(echo "$CODE" | awk '{ if (length > max) max = length } END { print max }')
+        INTERNAL_WIDTH=$((MAX_LEN + 2))
+        [ "$INTERNAL_WIDTH" -lt 30 ] && INTERNAL_WIDTH=30
+        BAR_WIDTH=$((INTERNAL_WIDTH + 6))
+        
+        echo -ne "${GRAY}┏" && printf '━%.0s' $(seq 1 $BAR_WIDTH) && echo -e "┓${NC}"
+        
+        # Syntax Highlight
+        if command -v pygmentize >/dev/null 2>&1; then
+            CLEAN_CODE=$(echo "$CODE" | pygmentize -l "$LANG" -f terminal256 2>/dev/null)
+        else
+            CLEAN_CODE=$(echo -e "${CYAN}$CODE${NC}")
+        fi
+        
+        i=1
+        while IFS= read -r line; do
+            RAW_LINE=$(echo "$line" | sed 's/\x1b\[[0-9;]*m//g')
+            RAW_LEN=${#RAW_LINE}
+            PADDING=$((INTERNAL_WIDTH - RAW_LEN))
+            
+            printf "${GRAY}┃${NC} ${PINK}%3d${NC}  %s" "$i" "$line"
+            printf '%*s' "$PADDING" ""
+            printf "${GRAY}┃${NC}\n"
+            ((i++))
+        done <<< "$CLEAN_CODE"
+        
+        echo -ne "${GRAY}┗" && printf '━%.0s' $(seq 1 $BAR_WIDTH) && echo -e "┛${NC}"
+    fi
+    
+    echo -e "${PINK}⏱  Response Time: ${DURATION}ms${NC}\n"
+done
+```
+
+**Key Safety Features Added:**
+
+1. **Dangerous Command Patterns Array**: Pre-defined list of dangerous commands that require confirmation
+
+2. **`requires_confirmation` JSON field**: AI can flag commands as dangerous in its response
+
+3. **Double Safety Check**: 
+   - AI's judgment via `requires_confirmation: true`
+   - Script's pattern matching via `is_dangerous_command()`
+
+4. **User Confirmation Prompt**: Shows warning with:
+   - Red warning message
+   - The exact command to be executed
+   - List of potential dangers
+   - Yes/no confirmation requirement (must type "yes" exactly)
+
+5. **Visual Warnings**: Red colored warnings for dangerous operations
+
+6. **Updated System Prompt**: AI is instructed to:
+   - Always set `requires_confirmation: true` for dangerous commands
+   - Explain WHY commands are dangerous
+   - Suggest safer alternatives
+
+**Example interaction:**
+```
+You > delete all log files
+Mr.claw > I can help you delete log files. 
+🔧 ACTION: EXECUTE
+
+⚠️  WARNING: Potentially dangerous command detected!
+Command: rm -rf *.log
+This command could:
+- Delete files or directories
+- Modify system settings
+- Harm your system
+
+Do you want to execute this command? (yes/no): no
+✗ Command execution cancelled by user
